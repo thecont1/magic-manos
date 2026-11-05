@@ -492,6 +492,15 @@ void main() {
   gl_FragColor = sum / total;
 }`;
 
+// A plain copy: the source pixels and nothing else. Used when the filter
+// stage is switched off, and when poppzz has no mask yet — neither of them
+// needs Bloom's working targets, which are large.
+const FRAG_COPY = PRELUDE + `
+uniform sampler2D uTex;
+void main() {
+  gl_FragColor = texture2D(uTex, vUV);
+}`;
+
 // Composite at full res: sharp layer at sharpAmt over the bilinear-upscaled
 // soft layer, plus thresholded bloom × boost. The "upscale" is just LINEAR
 // filtering on the small textures.
@@ -587,13 +596,14 @@ function makeProgram(fragSrc) {
 const progPre = makeProgram(FRAG_PRE);
 const progBlur = makeProgram(FRAG_BLUR);
 const progComp = makeProgram(FRAG_COMP);
+const progCopy = makeProgram(FRAG_COPY);
 const progPop = makeProgram(FRAG_POP);
 const progDbg = makeProgram(FRAG_DEBUG);
 
 // Enumerate each program's uniforms once; lookups return null for anything the
 // compiler dropped, which uniform*() calls then harmlessly ignore.
 const UL = new Map();
-for (const p of [progPre, progBlur, progComp, progPop, progDbg]) {
+for (const p of [progPre, progBlur, progComp, progCopy, progPop, progDbg]) {
   const m = {};
   const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
   for (let i = 0; i < n; i++) {
@@ -652,6 +662,16 @@ function allocTargets() {
   };
 }
 
+// Bloom's working targets are big — `thr` alone is a full-resolution buffer,
+// about 64 MB on a 4608×3456 frame. Poppzz never touches them, so they are
+// only allocated while Bloom is the selected filter, and released the moment
+// another filter takes over.
+function freeTargets() {
+  if (T) for (const k in T) { gl.deleteTexture(T[k].tex); gl.deleteFramebuffer(T[k].fbo); }
+  T = null;
+  dsFactor = 0;
+}
+
 function bindTex(unit, tex) {
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -704,8 +724,9 @@ function uploadSource(src, w, h) {
   gl.bindTexture(gl.TEXTURE_2D, texFull);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
   if (isGL2) gl.generateMipmap(gl.TEXTURE_2D);
-  dsFactor = DS(params[currentFilter].radius ?? 0);
-  allocTargets();
+  // The working targets belong to whichever filter is running; render() sorts
+  // that out, and frees Bloom's buffers when another filter takes over.
+  freeTargets();
   prepareMask(src, w, h);
   empty.hidden = true;
   canvas.hidden = false;
@@ -820,6 +841,9 @@ let maskDbg = null;      // RGBA: R = saliency, G = mask, B = kept, A = outline
 let maskReady = false;
 let maskTimer = 0;
 let maskMs = 0;          // how long the saliency pipeline took
+let maskVersion = 0;     // bumped on every rebuild; the blur cache keys on it
+let maskBlurred = -1;    // the version the blurred mask was made from
+let maskFeather = -1;    // ...and the feather it was made with
 
 // sRGB → linear, tabulated once.
 const LIN_LUT = new Float32Array(256);
@@ -1298,6 +1322,7 @@ function rebuildMask() {
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, dbg);
 
   maskReady = true;
+  maskVersion++;
   maskMs = performance.now() - t0;
 }
 
@@ -1306,6 +1331,9 @@ function rebuildMask() {
 // also has a floor: the mask is a binary image, and without a texel or two
 // of blur its edges show the texel grid as facets when the GPU scales it up.
 function blurMask(featherPx) {
+  // Cached: the blur only changes when the mask is rebuilt or the feather
+  // moves, and it was being redone on every single frame.
+  if (maskBlurred === maskVersion && maskFeather === featherPx) return;
   const rds = Math.max(MASK_MIN_SIGMA / SPREAD, featherPx * maskSrc.w / imgW);
   const st = SPREAD * 32;
   pass(progBlur, maskTmp, maskSrc.w, maskSrc.h, L => {
@@ -1318,19 +1346,20 @@ function blurMask(featherPx) {
     gl.uniform2f(L('uDir'), 0, 1); gl.uniform1f(L('uRadiusPx'), rds); gl.uniform1f(L('uSigmaTaps'), st);
     bindTex(0, maskTmp.tex);
   });
+  maskBlurred = maskVersion;
+  maskFeather = featherPx;
 }
 
 function applyPoppzz(src, dst, entry) {
   const p = entry.p;
+  // The mask is built the first time poppzz actually renders, so a session
+  // that never touches the filter never pays for it.
+  if (!maskReady) ensureMask();
   if (!maskReady) {
-    // No mask yet — show the source untouched.
-    pass(progComp, dst, imgW, imgH, L => {
+    // Still no mask — show the source untouched.
+    pass(progCopy, dst, imgW, imgH, L => {
       gl.uniform1f(L('uFlipY'), dst ? 0 : 1);
-      gl.uniform1f(L('uSharp'), 1);
-      gl.uniform1f(L('uBoost'), 0);
-      gl.uniform1f(L('uOn'), 0);
-      gl.uniform1i(L('uTex'), 0); gl.uniform1i(L('uSoft'), 1); gl.uniform1i(L('uBloom'), 2);
-      bindTex(0, src); bindTex(1, T.soft.tex); bindTex(2, T.bloom.tex);
+      bindTex(0, src);
     });
     return;
   }
@@ -1361,24 +1390,30 @@ function applyPoppzz(src, dst, entry) {
 RENDERERS.poppzz = applyPoppzz;
 
 function render() {
-  if (!imgW || !T) return;
+  if (!imgW) return;
   const t0 = performance.now();
   const on = onToggle.checked;
   const entry = currentEntry();
-  const f = DS(entry.p.radius ?? 0);
-  if (f !== dsFactor) { dsFactor = f; allocTargets(); }
+  const kind = entry.def.kind;
+  // Bloom's working targets are only worth their memory while Bloom is the
+  // filter running. `thr` is a full-resolution buffer — about 64 MB on a
+  // 4608×3456 frame — and poppzz never reads it, so switching filters used
+  // to allocate (and free) that whole buffer for nothing.
+  const needsBloom = kind === 'bloom' && on;
+  if (needsBloom) {
+    const f = DS(entry.p.radius ?? 0);
+    if (f !== dsFactor || !T) { dsFactor = f; allocTargets(); }
+  } else if (T) {
+    freeTargets();
+  }
   if (!on) {
     // Filter stage off: show the source pixels, untouched.
-    pass(progComp, null, imgW, imgH, L => {
+    pass(progCopy, null, imgW, imgH, L => {
       gl.uniform1f(L('uFlipY'), 1);
-      gl.uniform1f(L('uSharp'), 1);
-      gl.uniform1f(L('uBoost'), 0);
-      gl.uniform1f(L('uOn'), 0);
-      gl.uniform1i(L('uTex'), 0); gl.uniform1i(L('uSoft'), 1); gl.uniform1i(L('uBloom'), 2);
-      bindTex(0, texFull); bindTex(1, T.soft.tex); bindTex(2, T.bloom.tex);
+      bindTex(0, texFull);
     });
   } else {
-    RENDERERS[entry.def.kind](texFull, null, entry);
+    RENDERERS[kind](texFull, null, entry);
   }
   // gl.finish() only flushes the command buffer on most browsers; a readback
   // is what actually syncs on GPU completion, so the ms figure stays honest.

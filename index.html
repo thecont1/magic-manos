@@ -747,14 +747,21 @@ for (let i = 0; i < 256; i++) {
 }
 const labF = t => t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16 / 116);
 
-// sRGB → CIE Lab (D65).
-function rgbToLab(r, g, b) {
+// sRGB → CIE Lab (D65), written into `out`.
+//
+// The caller passes one array in and reads it straight back: allocating a
+// fresh three-element array per pixel was 300k little allocations at 640px,
+// and the garbage they left behind showed up as pauses in the mask build.
+function rgbToLab(r, g, b, out) {
   const R = LIN_LUT[r], G = LIN_LUT[g], B = LIN_LUT[b];
   const X = (R * 0.4124564 + G * 0.3575761 + B * 0.1804375) / 0.95047;
   const Y = (R * 0.2126729 + G * 0.7151522 + B * 0.0721750);
   const Z = (R * 0.0193339 + G * 0.1191920 + B * 0.9503041) / 1.08883;
   const fx = labF(X), fy = labF(Y), fz = labF(Z);
-  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+  out[0] = 116 * fy - 16;
+  out[1] = 500 * (fx - fy);
+  out[2] = 200 * (fy - fz);
+  return out;
 }
 
 // A separable blur on a float plane, as three box passes.
@@ -769,7 +776,10 @@ function blurPlane(src, w, h, sigma) {
   const inv = 1 / (2 * r + 1);
   let a = Float32Array.from(src);
   const b = new Float32Array(w * h);
-  for (let pass = 0; pass < 3; pass++) {
+  // Named `round`, not `pass`: `pass` is the name of the global draw helper
+  // further down, and shadowing it here is the kind of thing that breaks
+  // silently later.
+  for (let round = 0; round < 3; round++) {
     // horizontal, running sum, edges clamped
     for (let y = 0; y < h; y++) {
       const row = y * w;
@@ -951,9 +961,10 @@ function colourRarity(L, A, B, w, h) {
 function computeSaliency(data, w, h, centerWeight, sigma) {
   const n = w * h;
   const L = new Float32Array(n), A = new Float32Array(n), B = new Float32Array(n);
+  const lab = new Float32Array(3);
   let mL = 0, mA = 0, mB = 0;
   for (let i = 0; i < n; i++) {
-    const lab = rgbToLab(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
+    rgbToLab(data[i * 4], data[i * 4 + 1], data[i * 4 + 2], lab);
     L[i] = lab[0]; A[i] = lab[1]; B[i] = lab[2];
     mL += lab[0]; mA += lab[1]; mB += lab[2];
   }

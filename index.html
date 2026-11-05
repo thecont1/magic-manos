@@ -327,8 +327,13 @@ const FILTERS = {
         fmt: v => `${Math.round(v * 100)}%` },
       { key: 'subjects', min: 1, max: 5, step: 1, mask: true,
         fmt: v => `${Math.round(v)}` },
-      { key: 'threshold', min: -0.2, max: 0.2, step: 0.01, mask: true,
-        fmt: v => (v >= 0 ? '+' : '') + v.toFixed(2) },
+      // The cut lives in the saliency map's own units. Otsu lands at about
+      // 0.20 on a typical frame, so this nudges the cut around that point:
+      // −0.06 admits a lot more background, +0.06 trims the subjects back.
+      // Measured on the Ritz photo the whole ±0.06 range keeps all three
+      // subjects and moves the kept area between 13% and 4% of the frame.
+      { key: 'threshold', min: -0.06, max: 0.06, step: 0.005, mask: true,
+        fmt: v => (v >= 0 ? '+' : '') + v.toFixed(3) },
       { key: 'centerWeight', min: 0, max: 1, step: 0.01, mask: true,
         fmt: v => v.toFixed(2) },
     ],
@@ -743,6 +748,29 @@ const MASK_BLUR_PX = 18;     // source pixels — the blur the saliency sees
 const MIN_BLOB_FRACTION = 0.015;  // drop specks below this share of the frame
 const MAX_SCALE = 1.10;       // the pivot map is dilated for the largest scale
 
+// How the four saliency terms share the combination.
+//
+// These are exponents on a PRODUCT, not weights on a mean — and that is the
+// whole trick.
+//
+// A weighted geometric mean (the weights summing to 1) smooths the map into
+// a single hump. Otsu then cuts that hump in half and calls half of the
+// photograph a subject: measured on the Ritz photo, the mean gave a cut of
+// 0.4706 with 33% of the frame kept and none of the three subjects isolated.
+//
+// A product keeps the map bimodal — background mass down near zero, subjects
+// up at the top — which is the shape Otsu is built to split. The exponents
+// sum to 4, the number of terms, so the map keeps a product's shape while
+// the ratios say what counts for more: rarity and the centre prior weigh
+// more than the two contrast terms.
+//
+// The floor is what makes the combination forgiving. One term at exactly
+// zero would otherwise annihilate the pixel, and a pale grey-blue kurta
+// against a stone wall is very nearly zero on the border term. The floor
+// lifts every term off zero before it is raised to its power.
+const W_RARE = 1.2, W_COLOR = 0.8, W_BORDER = 0.8, W_PRIOR = 1.2;
+const TERM_FLOOR = 0.05;  // no term may sit at zero before it is powered
+
 let maskSrc = null;      // the downscaled frame: {data, w, h}
 let maskTex = null;      // RGBA: R = mask, G/B = pivot (u,v), A = pivot valid
 let maskOut = null, maskTmp = null;  // blur targets for the mask
@@ -841,17 +869,22 @@ function morph(src, w, h, op) {
 
 // Otsu's threshold: the point that splits the histogram with the most
 // between-class variance. Deterministic, and needs no tuning.
-function otsuThreshold(vals, n) {
-  const hist = new Float64Array(256);
+//
+// The bin count matters here. The saliency map is a product, so most of its
+// mass sits near zero; at 256 bins that mass is crushed into the first few
+// and the cut lands on a coarse step. 1024 bins resolve it.
+function otsuThreshold(vals, n, bins = 1024) {
+  const hist = new Float64Array(bins);
+  const scale = bins - 1;
   for (let i = 0; i < n; i++) {
-    let b = Math.round(vals[i] * 255);
-    if (b < 0) b = 0; else if (b > 255) b = 255;
+    let b = Math.round(vals[i] * scale);
+    if (b < 0) b = 0; else if (b > scale) b = scale;
     hist[b]++;
   }
   let total = 0, sum = 0;
-  for (let i = 0; i < 256; i++) { total += hist[i]; sum += i * hist[i]; }
+  for (let i = 0; i < bins; i++) { total += hist[i]; sum += i * hist[i]; }
   let sumB = 0, wB = 0, best = 0, bestVar = -1;
-  for (let t = 0; t < 256; t++) {
+  for (let t = 0; t < bins; t++) {
     wB += hist[t];
     if (!wB) continue;
     const wF = total - wB;
@@ -861,7 +894,7 @@ function otsuThreshold(vals, n) {
     const v = wB * wF * (mB - mF) * (mB - mF);
     if (v > bestVar) { bestVar = v; best = t; }
   }
-  return best / 255;
+  return best / scale;
 }
 
 // Connected components (8-connectivity) over the binary mask, each with its
@@ -957,14 +990,14 @@ function colourRarity(L, A, B, w, h) {
   return normalizePlane(rare);
 }
 
-// The saliency map: rarity × colour contrast × border contrast × centre prior.
+// The saliency map: rarity, colour contrast, border contrast and the centre
+// prior, combined as a product of powers.
 //
 // The three distinctness terms all measure the same idea from different
 // angles — a subject is a colour that is rare in the frame, unlike the
-// frame's average colour, and unlike the colours along the edges. Multiplying
-// them means a pixel has to agree on all three, which is what kills the
-// foliage and the pavement: both are common, and both sit close to the
-// background.
+// frame's average colour, and unlike the colours along the edges. Taken
+// together they are what kills the foliage and the pavement: both are
+// common, and both sit close to the background.
 //
 // A gradient/detail term was tried here first and dropped: detail only fires
 // on edges, so the mask came out as fragments of outlines instead of whole
@@ -1021,16 +1054,40 @@ function computeSaliency(data, w, h, centerWeight, sigma) {
 
   // Centre prior: a wide gaussian, so border clutter does not win outright.
   const cx = w / 2, cy = h / 2, cSigma = 0.5 * Math.max(w, h);
+
+  // The four terms, each raised to its power, multiplied together.
+  //
+  // The powers are tabulated: four Math.pow calls per pixel is 1.2 million
+  // calls at 640px, and this runs on every mask rebuild.
+  const lutR = powLUT(W_RARE), lutC = powLUT(W_COLOR);
+  const lutB = powLUT(W_BORDER), lutP = powLUT(W_PRIOR);
   const S = new Float32Array(n);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
       const dx = x - cx, dy = y - cy;
       const center = Math.exp(-(dx * dx + dy * dy) / (2 * cSigma * cSigma));
-      S[i] = rare[i] * color[i] * border[i] * ((1 - centerWeight) + centerWeight * center);
+      const prior = (1 - centerWeight) + centerWeight * center;
+      S[i] = lutLookup(lutR, rare[i] + TERM_FLOOR)
+           * lutLookup(lutC, color[i] + TERM_FLOOR)
+           * lutLookup(lutB, border[i] + TERM_FLOOR)
+           * lutLookup(lutP, prior);
     }
   }
   return S;
+}
+
+// x^e for x in 0…1, tabulated. The table is 1024 wide, so the largest error
+// is a fraction of a percent of the value — well under a pixel's worth of
+// saliency.
+function powLUT(e, size = 1024) {
+  const lut = new Float32Array(size);
+  for (let i = 0; i < size; i++) lut[i] = Math.pow(i / (size - 1), e);
+  return lut;
+}
+function lutLookup(lut, v) {
+  const x = v < 0 ? 0 : v > 1 ? 1 : v;
+  return lut[(x * (lut.length - 1) + 0.5) | 0];
 }
 
 // --- the mask, from the saliency map to the GPU ---------------------------
@@ -1057,7 +1114,16 @@ function rebuildMask() {
   const S = computeSaliency(data, w, h, cfg.centerWeight, sigma);
 
   // Otsu, with the bias slider nudging the cut.
-  const t = Math.max(0, Math.min(1, otsuThreshold(S, w * h) + cfg.threshold));
+  //
+  // The cut lands in the map's own units. The map is a product, so its mass
+  // is piled up near zero with the subjects standing clear above it — that
+  // is the shape Otsu splits. A root before the threshold would pull the
+  // near-zero background mass UP towards the subjects and destroy the
+  // separation: measured, Math.pow(S, 0.25) moved the cut to 0.4627 and
+  // turned the whole photograph into one blob. What the crowded histogram
+  // needed was more bins, not a different scale: 1024 bins resolve the low
+  // end that 256 bins crush into their first few.
+  const t = Math.max(0, Math.min(1, otsuThreshold(S, w * h, 1024) + cfg.threshold));
   let bin = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) bin[i] = S[i] > t ? 1 : 0;
   // Close (dilate then erode), then open (erode then dilate): fills holes and

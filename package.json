@@ -1,0 +1,9 @@
+{
+  "name": "magic-manos",
+  "private": true,
+  "version": "0.0.0",
+  "description": "One-click filters, applied honestly to honest pixels.",
+  "scripts": {
+    "start": "python3 -m http.server 8000 --bind 127.0.0.1"
+  }
+}

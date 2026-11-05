@@ -67,6 +67,13 @@
   }
   .filter-panel .panel-head .label { color: #ffb45e; }
   .panel-body { display: flex; flex-direction: column; gap: 9px; padding-top: 15px; }
+  /* The file input stays in the tab order — the `hidden` attribute would take
+     it out of it, and the label alone is not keyboard reachable. */
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+
   .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .row .mini { font-size: 11px; color: #8a8890; }
 
@@ -211,7 +218,7 @@
   <section class="panel image-panel">
     <div class="panel-head"><span class="label">Image</span></div>
     <div class="panel-body">
-      <label class="btn">Choose image<input id="file" type="file" accept="image/*" hidden></label>
+      <label class="btn">Choose image<input id="file" class="visually-hidden" type="file" accept="image/*"></label>
       <button id="sample" class="btn">Load Test pattern</button>
       <button id="forget" class="btn ghost" hidden>Clear image</button>
       <div class="row">
@@ -292,6 +299,38 @@ const FILTERS = {
       { key: 'thresh', min: 0, max: 1, step: 0.01 },
       { key: 'sharp',  min: 0, max: 1, step: 0.01 },
       { key: 'boost',  min: 0.5, max: 1.5, step: 0.01 },
+    ],
+  },
+  poppzz: {
+    name: 'poppzz',
+    kind: 'poppzz',
+    // The subject is found by classical saliency — colour rarity, colour
+    // contrast against the frame and against its edges, a gentle centre
+    // prior — thresholded with Otsu and cleaned up morphologically.
+    // Deterministic, no model, a few tens of milliseconds on a 256px copy, so
+    // the mask is built once per image and the sliders below stay live.
+    //
+    // `mask: true` marks the sliders that change the mask itself (rather than
+    // the composite); those trigger a rebuild instead of a redraw.
+    defaults: { scale: 1.03, feather: 12, bgDim: 0.18, bgDesat: 0.12, shadow: 0.35,
+                threshold: 0, centerWeight: 0.4, subjects: 3 },
+    params: [
+      { key: 'scale', min: 1, max: 1.1, step: 0.005,
+        fmt: v => `${v.toFixed(3)}×` },
+      { key: 'feather', min: 0, max: 40, step: 1,
+        fmt: v => `${Math.round(v)} px` },
+      { key: 'bgDim', min: 0, max: 0.6, step: 0.01,
+        fmt: v => `${Math.round(v * 100)}%` },
+      { key: 'bgDesat', min: 0, max: 1, step: 0.01,
+        fmt: v => `${Math.round(v * 100)}%` },
+      { key: 'shadow', min: 0, max: 1, step: 0.01,
+        fmt: v => `${Math.round(v * 100)}%` },
+      { key: 'subjects', min: 1, max: 5, step: 1, mask: true,
+        fmt: v => `${Math.round(v)}` },
+      { key: 'threshold', min: -0.2, max: 0.2, step: 0.01, mask: true,
+        fmt: v => (v >= 0 ? '+' : '') + v.toFixed(2) },
+      { key: 'centerWeight', min: 0, max: 1, step: 0.01, mask: true,
+        fmt: v => v.toFixed(2) },
     ],
   },
 };
@@ -448,6 +487,37 @@ void main() {
   gl_FragColor = outc;
 }`;
 
+// Poppzz composite: the masked subject is magnified about its own centroid
+// and laid over the untouched original, while the background is dimmed and
+// desaturated. The mask is sampled at the *scaled* coordinate, so it grows
+// with the object; the pivot map (dilated to the largest scale the slider
+// allows) says which blob owns this pixel and where its centre is.
+const FRAG_POP = PRELUDE + `
+uniform sampler2D uImg;
+uniform sampler2D uMask;
+uniform sampler2D uPivot;
+uniform float uScale;
+uniform float uDim;
+uniform float uDesat;
+uniform float uShadow;
+uniform vec2 uShadowOffset;
+void main() {
+  vec2 uv = vUV;
+  vec4 pv = texture2D(uPivot, uv);
+  vec2 pivot = pv.gb;   // the blob's centre, in uv
+  vec2 fgUV = pivot + (uv - pivot) / uScale;
+  float a = texture2D(uMask, fgUV).r * pv.a;
+  vec3 fg = texture2D(uImg, fgUV).rgb;
+  vec3 bg = texture2D(uImg, uv).rgb;
+  float lum = dot(bg, vec3(0.299, 0.587, 0.114));
+  bg = mix(bg, vec3(lum), uDesat);
+  bg *= (1.0 - uDim);
+  // The shadow is the blurred mask, nudged off the subject and darkened.
+  float sh = texture2D(uMask, uv + uShadowOffset).r;
+  bg *= (1.0 - uShadow * sh * 0.55);
+  gl_FragColor = vec4(mix(bg, fg, smoothstep(0.0, 1.0, a)), 1.0);
+}`;
+
 function compile(type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
@@ -469,11 +539,12 @@ function makeProgram(fragSrc) {
 const progPre = makeProgram(FRAG_PRE);
 const progBlur = makeProgram(FRAG_BLUR);
 const progComp = makeProgram(FRAG_COMP);
+const progPop = makeProgram(FRAG_POP);
 
 // Enumerate each program's uniforms once; lookups return null for anything the
 // compiler dropped, which uniform*() calls then harmlessly ignore.
 const UL = new Map();
-for (const p of [progPre, progBlur, progComp]) {
+for (const p of [progPre, progBlur, progComp, progPop]) {
   const m = {};
   const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
   for (let i = 0; i < n; i++) {
@@ -546,6 +617,38 @@ function pass(prog, target, w, h, setup) {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
+// The downscaled copy the saliency pipeline works on. The copy is sized to
+// the picture: a third of the long edge, clamped. Saliency does not need full
+// resolution, but the mask *is* the silhouette the user sees, and a mask
+// scaled up from 256px shows its texels as facets along the edge.
+function prepareMask(src, w, h) {
+  const long = Math.max(w, h);
+  const edge = Math.min(MASK_MAX_EDGE, Math.max(MASK_MIN_EDGE, Math.round(long / 3)));
+  const s = Math.min(1, edge / long);
+  const mw = Math.max(8, Math.round(w * s)), mh = Math.max(8, Math.round(h * s));
+  const c = document.createElement('canvas');
+  c.width = mw; c.height = mh;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(src, 0, 0, mw, mh);
+  maskSrc = { data: x.getImageData(0, 0, mw, mh).data, w: mw, h: mh };
+  allocMaskTargets(mw, mh);
+  maskReady = false;
+  // The mask is only worth building for the filter that uses it.
+  if (currentFilter === 'poppzz') rebuildMask();
+}
+
+// Build the mask if it is not there yet — called when poppzz is selected or
+// switched on, so a Bloom session never pays for the saliency pipeline.
+function ensureMask() {
+  if (maskSrc && !maskReady) rebuildMask();
+}
+
+// A mask slider moved: rebuild once the user stops dragging.
+function scheduleMaskRebuild() {
+  clearTimeout(maskTimer);
+  maskTimer = setTimeout(() => { rebuildMask(); scheduleRender(); }, 200);
+}
+
 function uploadSource(src, w, h) {
   imgW = w; imgH = h;
   canvas.width = w; canvas.height = h;
@@ -554,6 +657,7 @@ function uploadSource(src, w, h) {
   if (isGL2) gl.generateMipmap(gl.TEXTURE_2D);
   dsFactor = DS(params[currentFilter].radius ?? 0);
   allocTargets();
+  prepareMask(src, w, h);
   empty.hidden = true;
   canvas.hidden = false;
   $('save').disabled = false;
@@ -611,6 +715,438 @@ function applyFilter(src, dst, entry) {
 // gets a function here; everything else is wired to the bloom renderer.
 const RENDERERS = { bloom: applyFilter };
 
+// --- poppzz: the saliency pipeline ----------------------------------------
+//
+// The subject is found on a small copy of the frame with classical saliency:
+// colour rarity, colour contrast against the frame and against its edges, and
+// a gentle centre prior. The product is thresholded with Otsu, cleaned up
+// morphologically, split into connected components, and the stray specks are
+// dropped. It is deterministic, needs no model and no dependency, and costs
+// about a tenth of a second — so the mask is built once per image and the
+// sliders stay live at 60fps.
+
+const MASK_MIN_EDGE = 256;   // saliency does not need less than this
+const MASK_MAX_EDGE = 640;   // ...nor more: the mask is upsampled by the GPU
+const MASK_MIN_SIGMA = 1.2;  // texels — the anti-alias floor on the edge
+const MASK_BLUR_PX = 18;     // source pixels — the blur the saliency sees
+const MIN_BLOB_FRACTION = 0.015;  // drop specks below this share of the frame
+const MAX_SCALE = 1.10;       // the pivot map is dilated for the largest scale
+
+let maskSrc = null;      // the downscaled frame: {data, w, h}
+let maskTex = null;      // RGBA: R = mask, G/B = pivot (u,v), A = pivot valid
+let maskOut = null, maskTmp = null;  // blur targets for the mask
+let maskReady = false;
+let maskTimer = 0;
+let maskMs = 0;          // how long the saliency pipeline took
+
+// sRGB → linear, tabulated once.
+const LIN_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const c = i / 255;
+  LIN_LUT[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+const labF = t => t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16 / 116);
+
+// sRGB → CIE Lab (D65).
+function rgbToLab(r, g, b) {
+  const R = LIN_LUT[r], G = LIN_LUT[g], B = LIN_LUT[b];
+  const X = (R * 0.4124564 + G * 0.3575761 + B * 0.1804375) / 0.95047;
+  const Y = (R * 0.2126729 + G * 0.7151522 + B * 0.0721750);
+  const Z = (R * 0.0193339 + G * 0.1191920 + B * 0.9503041) / 1.08883;
+  const fx = labF(X), fy = labF(Y), fz = labF(Z);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+// A separable blur on a float plane, as three box passes.
+//
+// A gaussian would do, but its cost grows with the radius and the radius
+// grows with the mask resolution — three gaussian planes came to 150ms at
+// 640px. A box pass is a running sum, so it costs the same whatever the
+// radius, and three of them are close enough to a gaussian for a map that
+// only has to say "distinct" or "not".
+function blurPlane(src, w, h, sigma) {
+  const r = Math.max(1, Math.round(sigma));
+  const inv = 1 / (2 * r + 1);
+  let a = Float32Array.from(src);
+  const b = new Float32Array(w * h);
+  for (let pass = 0; pass < 3; pass++) {
+    // horizontal, running sum, edges clamped
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      let sum = 0;
+      for (let i = -r; i <= r; i++) sum += a[row + (i < 0 ? 0 : i >= w ? w - 1 : i)];
+      for (let x = 0; x < w; x++) {
+        b[row + x] = sum * inv;
+        const out = x - r, inn = x + r + 1;
+        sum += (inn < w ? a[row + inn] : a[row + w - 1]) - (out >= 0 ? a[row + out] : a[row]);
+      }
+    }
+    // vertical, same trick
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let i = -r; i <= r; i++) sum += b[(i < 0 ? 0 : i >= h ? h - 1 : i) * w + x];
+      for (let y = 0; y < h; y++) {
+        a[y * w + x] = sum * inv;
+        const out = y - r, inn = y + r + 1;
+        sum += (inn < h ? b[inn * w + x] : b[(h - 1) * w + x]) - (out >= 0 ? b[out * w + x] : b[x]);
+      }
+    }
+  }
+  return a;
+}
+
+// Min or max over a 3×3 box — the structuring element for the morphology.
+function morph(src, w, h, op) {
+  const pick = op === 'max' ? Math.max : Math.min;
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = src[y * w + x];
+      if (x > 0) v = pick(v, src[y * w + x - 1]);
+      if (x < w - 1) v = pick(v, src[y * w + x + 1]);
+      tmp[y * w + x] = v;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = tmp[y * w + x];
+      if (y > 0) v = pick(v, tmp[(y - 1) * w + x]);
+      if (y < h - 1) v = pick(v, tmp[(y + 1) * w + x]);
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+// Otsu's threshold: the point that splits the histogram with the most
+// between-class variance. Deterministic, and needs no tuning.
+function otsuThreshold(vals, n) {
+  const hist = new Float64Array(256);
+  for (let i = 0; i < n; i++) {
+    let b = Math.round(vals[i] * 255);
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    hist[b]++;
+  }
+  let total = 0, sum = 0;
+  for (let i = 0; i < 256; i++) { total += hist[i]; sum += i * hist[i]; }
+  let sumB = 0, wB = 0, best = 0, bestVar = -1;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (!wB) continue;
+    const wF = total - wB;
+    if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > bestVar) { bestVar = v; best = t; }
+  }
+  return best / 255;
+}
+
+// Connected components (8-connectivity) over the binary mask, each with its
+// area and a saliency-weighted centroid.
+function labelBlobs(bin, w, h, sal) {
+  const labels = new Int32Array(w * h).fill(-1);
+  const blobs = [];
+  const stack = [];
+  for (let start = 0; start < w * h; start++) {
+    if (!bin[start] || labels[start] >= 0) continue;
+    const id = blobs.length;
+    labels[start] = id;
+    stack.length = 0; stack.push(start);
+    let area = 0, s = 0, sx = 0, sy = 0;
+    let x0 = w, y0 = h, x1 = 0, y1 = 0;
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % w, y = (p / w) | 0;
+      const v = sal[p];
+      area++; s += v; sx += x * v; sy += y * v;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const q = ny * w + nx;
+          if (bin[q] && labels[q] < 0) { labels[q] = id; stack.push(q); }
+        }
+      }
+    }
+    blobs.push({ id, area, sal: s, cx: s ? sx / s : x0, cy: s ? sy / s : y0, x0, y0, x1, y1 });
+  }
+  return { blobs, labels };
+}
+
+// A plane normalised to 0…1 — every map below is compared against its own
+// extremes, so a photo that is mostly one colour does not skew the rest.
+function normalizePlane(v) {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < v.length; i++) {
+    if (v[i] < lo) lo = v[i];
+    if (v[i] > hi) hi = v[i];
+  }
+  const range = hi - lo || 1;
+  const out = new Float32Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = (v[i] - lo) / range;
+  return out;
+}
+
+// Colour rarity: how unusual this pixel's colour is in the frame. A Lab
+// histogram is built over the whole picture, smoothed, and a pixel scores
+// high when the colours around it are rare — the yellow of a shrine, the
+// red of a sari. Common colours (sky, foliage, pavement) score low.
+//
+// Rarity is what makes the mask a *shape* rather than a set of edges: it
+// holds across the whole interior of a flat-coloured object.
+function colourRarity(L, A, B, w, h) {
+  const n = w * h;
+  const binL = 16, binA = 16, binB = 16;
+  const hist = new Float64Array(binL * binA * binB);
+  const at = i => {
+    const l = Math.min(binL - 1, Math.max(0, Math.floor(L[i] / 100 * binL)));
+    const a = Math.min(binA - 1, Math.max(0, Math.floor((A[i] + 100) / 200 * binA)));
+    const b = Math.min(binB - 1, Math.max(0, Math.floor((B[i] + 100) / 200 * binB)));
+    return (l * binA + a) * binB + b;
+  };
+  for (let i = 0; i < n; i++) hist[at(i)]++;
+  // Smooth the histogram so a colour that merely straddles a bin boundary
+  // does not look rare.
+  const sm = new Float64Array(hist.length);
+  for (let l = 0; l < binL; l++) {
+    for (let a = 0; a < binA; a++) {
+      for (let b = 0; b < binB; b++) {
+        let sum = 0, count = 0;
+        for (let dl = -1; dl <= 1; dl++) {
+          for (let da = -1; da <= 1; da++) {
+            for (let db = -1; db <= 1; db++) {
+              const ll = l + dl, aa = a + da, bb = b + db;
+              if (ll < 0 || aa < 0 || bb < 0 || ll >= binL || aa >= binA || bb >= binB) continue;
+              sum += hist[(ll * binA + aa) * binB + bb]; count++;
+            }
+          }
+        }
+        sm[(l * binA + a) * binB + b] = sum / count;
+      }
+    }
+  }
+  let peak = 0;
+  for (const v of sm) if (v > peak) peak = v;
+  const rare = new Float32Array(n);
+  for (let i = 0; i < n; i++) rare[i] = 1 - sm[at(i)] / (peak || 1);
+  return normalizePlane(rare);
+}
+
+// The saliency map: rarity × colour contrast × border contrast × centre prior.
+//
+// The three distinctness terms all measure the same idea from different
+// angles — a subject is a colour that is rare in the frame, unlike the
+// frame's average colour, and unlike the colours along the edges. Multiplying
+// them means a pixel has to agree on all three, which is what kills the
+// foliage and the pavement: both are common, and both sit close to the
+// background.
+//
+// A gradient/detail term was tried here first and dropped: detail only fires
+// on edges, so the mask came out as fragments of outlines instead of whole
+// subjects.
+function computeSaliency(data, w, h, centerWeight, sigma) {
+  const n = w * h;
+  const L = new Float32Array(n), A = new Float32Array(n), B = new Float32Array(n);
+  let mL = 0, mA = 0, mB = 0;
+  for (let i = 0; i < n; i++) {
+    const lab = rgbToLab(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
+    L[i] = lab[0]; A[i] = lab[1]; B[i] = lab[2];
+    mL += lab[0]; mA += lab[1]; mB += lab[2];
+  }
+  mL /= n; mA /= n; mB /= n;
+
+  // Colour contrast: the distance between a lightly blurred pixel and the
+  // frame's mean Lab. The blur is measured in *source* pixels, so the map
+  // comes out the same whether the mask copy is 256px or 640px — in texels
+  // alone it would be a much tighter blur at the higher resolution, and the
+  // subject's own texture would cut it into pieces.
+  const Lb = blurPlane(L, w, h, sigma);
+  const Ab = blurPlane(A, w, h, sigma);
+  const Bb = blurPlane(B, w, h, sigma);
+  const colorRaw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const dL = Lb[i] - mL, dA = Ab[i] - mA, dB = Bb[i] - mB;
+    colorRaw[i] = Math.sqrt(dL * dL + dA * dA + dB * dB);
+  }
+  const color = normalizePlane(colorRaw);
+
+  // Border contrast: the same distance, but against the colours along the
+  // edge of the frame. The edge is where the background usually is, so this
+  // separates a subject from its surroundings even when the whole frame
+  // shares one colour.
+  const ring = Math.max(2, Math.round(Math.min(w, h) * 0.07));
+  let bL = 0, bA = 0, bB = 0, bn = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (x >= ring && x < w - ring && y >= ring && y < h - ring) continue;
+      const i = y * w + x;
+      bL += L[i]; bA += A[i]; bB += B[i]; bn++;
+    }
+  }
+  bL /= bn; bA /= bn; bB /= bn;
+  const borderRaw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const dL = Lb[i] - bL, dA = Ab[i] - bA, dB = Bb[i] - bB;
+    borderRaw[i] = Math.sqrt(dL * dL + dA * dA + dB * dB);
+  }
+  const border = normalizePlane(borderRaw);
+
+  const rare = colourRarity(L, A, B, w, h);
+
+  // Centre prior: a wide gaussian, so border clutter does not win outright.
+  const cx = w / 2, cy = h / 2, cSigma = 0.5 * Math.max(w, h);
+  const S = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const dx = x - cx, dy = y - cy;
+      const center = Math.exp(-(dx * dx + dy * dy) / (2 * cSigma * cSigma));
+      S[i] = rare[i] * color[i] * border[i] * ((1 - centerWeight) + centerWeight * center);
+    }
+  }
+  return S;
+}
+
+// --- the mask, from the saliency map to the GPU ---------------------------
+
+function allocMaskTargets(w, h) {
+  for (const t of [maskTex, maskOut, maskTmp]) {
+    if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+  }
+  maskTex = makeTarget(w, h);
+  maskOut = makeTarget(w, h);
+  maskTmp = makeTarget(w, h);
+}
+
+// Rebuild the mask from the downscaled frame. Called once per image, and
+// again whenever a slider that changes the mask itself moves.
+function rebuildMask() {
+  if (!maskSrc) return;
+  const t0 = performance.now();
+  const { data, w, h } = maskSrc;
+  const cfg = params.poppzz;
+  // The saliency's blur is measured in source pixels, so it means the same
+  // thing whatever size the mask copy is.
+  const sigma = Math.max(1, MASK_BLUR_PX * maskSrc.w / imgW);
+  const S = computeSaliency(data, w, h, cfg.centerWeight, sigma);
+
+  // Otsu, with the bias slider nudging the cut.
+  const t = Math.max(0, Math.min(1, otsuThreshold(S, w * h) + cfg.threshold));
+  let bin = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) bin[i] = S[i] > t ? 1 : 0;
+  // Close (dilate then erode), then open (erode then dilate): fills holes and
+  // clears the ragged edge the threshold leaves behind. The close runs twice
+  // so that parts of a subject separated by a few pixels join up.
+  bin = morph(morph(bin, w, h, 'max'), w, h, 'min');
+  bin = morph(morph(bin, w, h, 'max'), w, h, 'min');
+  bin = morph(morph(bin, w, h, 'min'), w, h, 'max');
+
+  const { blobs, labels } = labelBlobs(bin, w, h, S);
+  // Drop the specks — the birds, the bright buttons. A blob must clear the
+  // frame-share floor, and also stay in proportion to the biggest subject so
+  // a second, smaller subject is not thrown away with the specks. What is
+  // left is ranked by total saliency: the subjects, not the clutter.
+  const minArea = MIN_BLOB_FRACTION * w * h;
+  const biggest = blobs.reduce((m, b) => Math.max(m, b.area), 0);
+  const kept = blobs
+    .filter(b => b.area >= minArea || b.area >= biggest * 0.2)
+    .sort((a, b) => b.sal - a.sal)
+    .slice(0, Math.max(1, Math.round(cfg.subjects)));
+
+  const px = new Uint8Array(w * h * 4);
+  for (const b of kept) {
+    for (let y = b.y0; y <= b.y1; y++) {
+      for (let x = b.x0; x <= b.x1; x++) {
+        const i = y * w + x;
+        if (labels[i] === b.id) px[i * 4] = 255;
+      }
+    }
+  }
+  // The pivot map: for every pixel of the subject's footprint at the largest
+  // scale the slider allows, the centre of the blob it belongs to. Inverse
+  // warp the footprint back onto the mask to find out which blob it is.
+  // The warp only reaches the blob's own bounding box (grown by the largest
+  // scale), so there is no need to walk the whole frame for each subject.
+  for (const b of kept) {
+    const pu = Math.round(b.cx / w * 255);
+    const pv = Math.round(b.cy / h * 255);
+    const ox0 = Math.max(0, Math.floor(b.cx - (b.cx - b.x0) * MAX_SCALE));
+    const ox1 = Math.min(w - 1, Math.ceil(b.cx + (b.x1 - b.cx) * MAX_SCALE));
+    const oy0 = Math.max(0, Math.floor(b.cy - (b.cy - b.y0) * MAX_SCALE));
+    const oy1 = Math.min(h - 1, Math.ceil(b.cy + (b.y1 - b.cy) * MAX_SCALE));
+    for (let y = oy0; y <= oy1; y++) {
+      for (let x = ox0; x <= ox1; x++) {
+        const sx = b.cx + (x - b.cx) / MAX_SCALE;
+        const sy = b.cy + (y - b.cy) / MAX_SCALE;
+        const ix = Math.round(sx), iy = Math.round(sy);
+        if (ix < 0 || iy < 0 || ix >= w || iy >= h) continue;
+        if (labels[iy * w + ix] !== b.id) continue;
+        const i = y * w + x;
+        px[i * 4 + 1] = pu;
+        px[i * 4 + 2] = pv;
+        px[i * 4 + 3] = 255;   // this pixel has a pivot
+      }
+    }
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, maskTex.tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  maskReady = true;
+  maskMs = performance.now() - t0;
+}
+
+// The mask's own blur — the feather on the boundary. Radius is given in image
+// pixels, so it is converted into the mask texture's own texels. The blur
+// also has a floor: the mask is a binary image, and without a texel or two
+// of blur its edges show the texel grid as facets when the GPU scales it up.
+function blurMask(featherPx) {
+  const rds = Math.max(MASK_MIN_SIGMA / SPREAD, featherPx * maskSrc.w / imgW);
+  const st = SPREAD * 32;
+  pass(progBlur, maskTmp, maskSrc.w, maskSrc.h, L => {
+    gl.uniform1f(L('uFlipY'), 0); gl.uniform2f(L('uTexel'), 1 / maskSrc.w, 1 / maskSrc.h);
+    gl.uniform2f(L('uDir'), 1, 0); gl.uniform1f(L('uRadiusPx'), rds); gl.uniform1f(L('uSigmaTaps'), st);
+    bindTex(0, maskTex.tex);
+  });
+  pass(progBlur, maskOut, maskSrc.w, maskSrc.h, L => {
+    gl.uniform1f(L('uFlipY'), 0); gl.uniform2f(L('uTexel'), 1 / maskSrc.w, 1 / maskSrc.h);
+    gl.uniform2f(L('uDir'), 0, 1); gl.uniform1f(L('uRadiusPx'), rds); gl.uniform1f(L('uSigmaTaps'), st);
+    bindTex(0, maskTmp.tex);
+  });
+}
+
+function applyPoppzz(src, dst, entry) {
+  const p = entry.p;
+  if (!maskReady) {
+    // No mask yet — show the source untouched.
+    pass(progComp, dst, imgW, imgH, L => {
+      gl.uniform1f(L('uFlipY'), dst ? 0 : 1);
+      gl.uniform1f(L('uSharp'), 1);
+      gl.uniform1f(L('uBoost'), 0);
+      gl.uniform1f(L('uOn'), 0);
+      gl.uniform1i(L('uTex'), 0); gl.uniform1i(L('uSoft'), 1); gl.uniform1i(L('uBloom'), 2);
+      bindTex(0, src); bindTex(1, T.soft.tex); bindTex(2, T.bloom.tex);
+    });
+    return;
+  }
+  blurMask(p.feather);
+  pass(progPop, dst, imgW, imgH, L => {
+    gl.uniform1f(L('uFlipY'), dst ? 0 : 1);
+    gl.uniform1f(L('uScale'), p.scale);
+    gl.uniform1f(L('uDim'), p.bgDim);
+    gl.uniform1f(L('uDesat'), p.bgDesat);
+    gl.uniform1f(L('uShadow'), p.shadow);
+    gl.uniform2f(L('uShadowOffset'), 0.0015, 0.0015);
+    gl.uniform1i(L('uImg'), 0); gl.uniform1i(L('uMask'), 1); gl.uniform1i(L('uPivot'), 2);
+    bindTex(0, src); bindTex(1, maskOut.tex); bindTex(2, maskTex.tex);
+  });
+}
+
+RENDERERS.poppzz = applyPoppzz;
+
 function render() {
   if (!imgW || !T) return;
   const t0 = performance.now();
@@ -635,7 +1171,10 @@ function render() {
   // is what actually syncs on GPU completion, so the ms figure stays honest.
   gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
   const ms = (performance.now() - t0).toFixed(1);
-  stat.textContent = `${on ? `${entry.def.name} · blur@1/${dsFactor} · ` : ''}render ${ms} ms`;
+  const what = entry.def.kind === 'poppzz'
+    ? `mask ${maskMs.toFixed(0)} ms`
+    : `blur@1/${dsFactor}`;
+  stat.textContent = `${on ? `${entry.def.name} · ${what} · ` : ''}render ${ms} ms`;
 }
 
 function scheduleRender() {
@@ -725,6 +1264,8 @@ async function clearImage() {
   await forgetImage();
   imgW = 0; imgH = 0;
   imageName = null;
+  maskSrc = null;
+  maskReady = false;
   canvas.hidden = true;
   empty.hidden = false;
   $('save').disabled = true;
@@ -816,6 +1357,7 @@ $('settings').addEventListener('click', () => {
 
 onToggle.addEventListener('change', () => {
   syncToggleUI();
+  ensureMask();
   saveState();
   scheduleRender();
 });
@@ -874,6 +1416,8 @@ function buildControls() {
       out.textContent = fmt(d, params[currentFilter][d.key]);
       scheduleRender();
       saveState();
+      // A mask slider changes the mask itself, not just the composite.
+      if (d.mask) scheduleMaskRebuild();
     });
   }
   $('chip').textContent = def.name;
@@ -890,6 +1434,7 @@ function syncOutputs() {
 $('filter').addEventListener('change', e => {
   currentFilter = e.target.value;
   buildControls();
+  ensureMask();
   saveState();
   scheduleRender();
 });

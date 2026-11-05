@@ -5,10 +5,14 @@ Photographic filter lab.
 ## Run it
 
 ```sh
-./serve.sh            # http://localhost:8000
-# or: bun run start
-# or just open index.html — it has no dependencies
+npm install            # once — TypeScript, and nothing else
+npm start              # builds to dist/ and serves http://localhost:8000
+# or, in another shell: npm run watch   (rebuilds on save)
 ```
+
+The app needs a static server — it is built as ES modules, and browsers do
+not load those from `file://`. `./serve.sh` serves the repo without building,
+so use it only after a `npm run build`.
 
 Upload an image, pick a filter, tune its parameters, then **Settings ↓**
 downloads the recipe as timestamped JSON and **Save PNG** exports the render
@@ -18,9 +22,36 @@ the remembered copy).
 
 ## Layout
 
-- `index.html` — the whole app: WebGL pipeline, filter registry, UI.
-- `bloom/` — reference material from the Bloom evaluation (Python port of the
-  shader pipeline, parameter sweeps, verification captures, test photo).
+```
+index.html            the markup — nothing else
+css/app.css           the design: palette, panels, sliders, the switch
+src/                  TypeScript, the source of truth
+  app.ts                the shell: loading, export, the keyboard
+  gl.ts                 the WebGL layer: context, programs, targets, pass()
+  state.ts              the app's mutable state
+  registry.ts           the filter registry
+  ui.ts                 the control panel
+  persist.ts            localStorage and IndexedDB
+  filters/
+    bloom.ts            Bloom's shaders, targets, renderer and parameters
+    poppzz.ts           poppzz's shaders, mask textures, renderer, parameters
+    poppzz-saliency.ts  the saliency pipeline — pure, no DOM, no WebGL
+dist/                 the built app (gitignored)
+lab/                  the evaluation rigs — tuning, not shipping
+  bloom/                a Python port of the Bloom shader pipeline, sweeps
+  poppzz/               the saliency harness and its hand-marked ground truth
+  shots/                test photographs and verification captures
+```
+
+The rule the tree follows: **design in `css/`, logic in `src/`, and one
+filter per module.** A filter owns its shaders, its working targets, its
+parameter surface and its renderer; the panel is generated from what the
+filter declares, so adding a filter means adding a file and touching nothing
+else.
+
+`src/filters/poppzz-saliency.ts` is deliberately pure — no DOM, no WebGL, no
+globals. That is what lets `lab/poppzz/` measure the pipeline the browser
+actually runs, rather than a copy of it.
 
 Everything lives in the **left sidebar**, in three demarcated panels:
 
@@ -40,8 +71,8 @@ scrollable top strip.
 
 ## Filters
 
-Filters live in the `FILTERS` registry in `index.html`. Each entry declares its
-name, parameter surface (sliders are generated from it), defaults, and a
+Filters live in the `FILTERS` registry in `src/registry.ts`. Each entry declares
+its name, parameter surface (sliders are generated from it), defaults, and a
 `kind` that picks its renderer.
 **Bloom** is the first — thresholded highlight bloom over a downsampled
 separable gaussian, composited under a sharp layer.
@@ -213,4 +244,36 @@ load rather than trusted.
 
 The last *image* is kept separately, in IndexedDB, since a full-resolution
 file is far past what `localStorage` will hold.
+
+## The lab
+
+`lab/` holds the rigs used to *tune* the filters — they are not part of the
+app and nothing in `src/` depends on them.
+
+`lab/poppzz/` measures the saliency pipeline against hand-marked ground
+truth:
+
+```sh
+npm run lab
+```
+
+It imports `src/filters/poppzz-saliency.ts` — the module the browser actually
+runs — so what it measures is what ships. It scores the resulting mask
+against boxes marked by hand (`lab/poppzz/ground-truth.ts`): three subjects
+that must be found, and seven background regions that must not be, and it
+fails if a subject goes missing. The photograph is the Ritz photo at the size
+the app's mask copy actually is (640×480), and the boxes are in those
+coordinates.
+
+On the Ritz photo it reports three subjects found, none of them touching the
+background, and the kept area at 5.65% of the frame. The harness also writes a
+preview of the mask to `lab/poppzz/out/`.
+
+`lab/bloom/` is the older rig: a Python port of the Bloom shader pipeline, so
+recipes could be swept offline instead of round-tripping through the browser,
+plus a check that the port still matches the app.
+
+One photograph is not enough to tell a formulation that works from one that
+happens to fit that frame — the ground truth needs at least two.
+
 

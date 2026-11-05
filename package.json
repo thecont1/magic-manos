@@ -3,7 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "description": "One-click filters, applied honestly to honest pixels.",
+  "type": "module",
   "scripts": {
-    "start": "python3 -m http.server 8000 --bind 127.0.0.1"
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.lab.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "lab": "node lab/poppzz/verify.ts",
+    "start": "npm run build && python3 -m http.server 8000 --bind 127.0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }

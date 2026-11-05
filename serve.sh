@@ -1,6 +1,7 @@
 #!/bin/sh
-# Serve the app locally. index.html is a single self-contained file — any
-# static server works; this just saves you typing it.
+# Serve the repo locally. The app is built as ES modules, so it needs a
+# static server — run `npm run build` first, or use `npm start` which does
+# both.
 cd "$(dirname "$0")"
 PORT="${1:-8000}"
 echo "magic-manos on http://localhost:$PORT"

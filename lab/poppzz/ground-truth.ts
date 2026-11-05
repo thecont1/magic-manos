@@ -34,5 +34,19 @@ export const BACKGROUND: Box[] = [
   { name: 'lawn', x0: 0, y0: 400, x1: 90, y1: 478 },
 ];
 
+/**
+ * OPTIONAL is for things that are neither clearly a subject nor clearly
+ * background — architecture that a viewer might reasonably call either.
+ * They are measured and reported, but they never decide pass or fail.
+ */
+export const OPTIONAL: Box[] = [];
+
 /** A subject counts as found if the mask covers at least this share of it. */
 export const COVERAGE_THRESHOLD = 0.05;
+
+/**
+ * A mask may not cover more than this share of the background it was told
+ * about. A mask that touches a background region is a false positive,
+ * however plausible it looks.
+ */
+export const CONTAMINATION_CEILING = 0.05;

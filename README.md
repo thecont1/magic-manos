@@ -254,20 +254,33 @@ app and nothing in `src/` depends on them.
 truth:
 
 ```sh
-npm run lab
+npm run lab          # measure every photograph, report PASS or FAIL
+npm run lab:check    # the same, but a failure exits non-zero
+npm run lab:sweep    # sweep the knobs and the constants
 ```
 
 It imports `src/filters/poppzz-saliency.ts` — the module the browser actually
-runs — so what it measures is what ships. It scores the resulting mask
-against boxes marked by hand (`lab/poppzz/ground-truth.ts`): three subjects
-that must be found, and seven background regions that must not be, and it
-fails if a subject goes missing. The photograph is the Ritz photo at the size
-the app's mask copy actually is (640×480), and the boxes are in those
-coordinates.
+runs — so what it measures is what ships. Each photograph is a real picture at
+the size the app's mask copy actually is (640×480, a third of the long edge,
+clamped), scored against boxes marked by hand: subjects that must be found,
+background regions that must not be, and *optional* regions — neither clearly
+one nor the other — that are measured but never decide the verdict.
 
-On the Ritz photo it reports three subjects found, none of them touching the
-background, and the kept area at 5.65% of the frame. The harness also writes a
-preview of the mask to `lab/poppzz/out/`.
+Two photographs are measured:
+
+- **the Ritz photo** (`lab/shots/ritz-carlton-bangalore.jpg`) — three
+  subjects, seven background regions. It passes: three subjects found, none
+  of them touching the background, kept area 5.65% of the frame.
+- **the temple photo** (`lab/shots/temple-oneplus.jpg`) — a selfie: a man in
+  a red shirt, a woman holding a phone, the gopuram behind them and a bank of
+  bougainvillea. It **fails**, and the failure is informative: poppzz keeps
+  the man's shirt, his hair and the bougainvillea, and drops the woman's face
+  as a speck. The solidity and edge rules cannot catch it, because the
+  flowers are a solid mass rather than lacework — colour-rarity saliency is
+  built to find exactly that.
+
+The harness writes a preview of each mask to `lab/poppzz/out/`, and prints
+every candidate blob with the reason it was kept or dropped.
 
 `lab/bloom/` is the older rig: a Python port of the Bloom shader pipeline, so
 recipes could be swept offline instead of round-tripping through the browser,
@@ -275,5 +288,6 @@ plus a check that the port still matches the app.
 
 One photograph is not enough to tell a formulation that works from one that
 happens to fit that frame — the ground truth needs at least two.
+
 
 

@@ -153,16 +153,19 @@ Two more details matter more than they look:
 
 The product is thresholded with Otsu (the `threshold` slider biases the cut),
 cleaned with a morphological close and open, split into connected components,
-and the specks are dropped: a blob has to clear 1.5% of the frame, or 20% of
+and the specks are dropped: a blob has to clear 1.2% of the frame, or 20% of
 the biggest subject's area.
 
 **Which blobs are subjects.** The blobs are ranked by **total saliency** —
 the sum of the saliency map over the blob — and the top `subjects` of them pop
 out. Two filters sit on top of that ranking:
 
-- **Solidity.** A blob has to fill at least 30% of its own bounding box
-  (`MIN_FILL`) to be eligible at all. A hedge is lacework — it fills its
-  bounding box in a scatter, not a shape — and a tree canopy is the same.
+- **Solidity.** A blob has to fill at least 55% of its own bounding box
+  (`MIN_FILL`) to be eligible — but only if it is big enough to be scenery
+  (5% of the frame or more, `MIN_MASS_FRACTION`). A hedge is lacework — it
+  fills its bounding box in a scatter, not a shape — and a tree canopy is the
+  same. Below that mass, a scattered blob is a detail of something rather
+  than a scene: a face in shadow, a hand, a piece of lace, so it is exempt.
   Ranking by fill ratio instead of filtering on it does not work: it demotes
   the large, real foreground sari below a small solid bench blob.
 - **Edge penalty.** A blob that runs off the edge of the frame was never a
@@ -273,11 +276,26 @@ Two photographs are measured:
   of them touching the background, kept area 5.65% of the frame.
 - **the temple photo** (`lab/shots/temple-oneplus.jpg`) — a selfie: a man in
   a red shirt, a woman holding a phone, the gopuram behind them and a bank of
-  bougainvillea. It **fails**, and the failure is informative: poppzz keeps
-  the man's shirt, his hair and the bougainvillea, and drops the woman's face
-  as a speck. The solidity and edge rules cannot catch it, because the
-  flowers are a solid mass rather than lacework — colour-rarity saliency is
-  built to find exactly that.
+  bougainvillea. It passes: three subjects found, the flowers and the spire
+  left out, kept area 23.9% of the frame.
+
+  It used to fail, and the failure was informative. poppzz kept the man's
+  shirt, his hair and the bougainvillea, and dropped the woman's face as a
+  speck. Two separate rules were to blame, and neither was the saliency
+  itself:
+
+  - her face is 1.42% of the frame, under the 1.5% speck floor, so it was
+    discarded before it was ever ranked against the rest;
+  - the bougainvillea is a bank of individual blooms — lacework, exactly what
+    the solidity rule exists to catch — but it fills 0.50 of its bounding
+    box, and the floor was 0.30, so it passed.
+
+  The fix was calibration, not a new signal. The speck floor came down to
+  1.2%, and the solidity floor went up to 0.55 — but only for blobs big
+  enough to be *scenery* (5% of the frame or more). A small scattered blob
+  is a detail of something, not a scene: a face in shadow, a hand, a piece
+  of lace. So the solidity rule reaches hedges and flower banks and leaves
+  small subjects alone. The Ritz photo's numbers are unchanged by this.
 
 The harness writes a preview of each mask to `lab/poppzz/out/`, and prints
 every candidate blob with the reason it was kept or dropped.

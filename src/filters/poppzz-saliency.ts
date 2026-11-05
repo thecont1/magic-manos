@@ -15,7 +15,7 @@
  */
 
 export const MASK_BLUR_PX = 18;     // source pixels — the blur the saliency sees
-export const MIN_BLOB_FRACTION = 0.015;  // drop specks below this share of the frame
+export const MIN_BLOB_FRACTION = 0.012;  // drop specks below this share of the frame
 export const MAX_SCALE = 1.10;       // the pivot map is dilated for the largest scale
 
 // How the four saliency terms share the combination.
@@ -44,7 +44,18 @@ export const TERM_FLOOR = 0.05;  // no term may sit at zero before it is powered
 // A blob has to be solid to be a subject. A hedge is lacework — it fills
 // its bounding box in a scatter, not a shape — and a tree canopy is the
 // same. Below this fill ratio a blob is background, whatever its saliency.
-export const MIN_FILL = 0.30;
+//
+// The floor is high because the measurements say so. On the Ritz photo a
+// subject fills 0.54–0.64 of its box; on the temple photo the bougainvillea
+// — a bank of individual blooms, exactly the lacework this rule exists for
+// — fills 0.50, and the woman's face fills 0.67.
+export const MIN_FILL = 0.55;
+// ...but the floor only applies to blobs big enough to be scenery. A small
+// scattered blob is a detail of something, not a scene: a face in shadow, a
+// hand, a piece of lace. The solidity rule is about hedges and flower banks,
+// and those are big; exempting the small ones keeps a distant person from
+// being thrown away with the specks.
+export const MIN_MASS_FRACTION = 0.05;
 // A blob that runs off the edge of the frame is background: it was never a
 // whole object in the first place. Its score is halved, not discarded —
 // sometimes the subject really does touch the edge.
@@ -532,14 +543,21 @@ export function buildMask(
   // Drop the specks — the birds, the bright buttons. A blob must clear the
   // frame-share floor, and also stay in proportion to the biggest subject so
   // a second, smaller subject is not thrown away with the specks.
+  //
+  // The floor is low enough to keep a face: on the temple photo the woman's
+  // face is 1.42% of the frame, and at a 1.5% floor it was dropped as a
+  // speck before it was ever ranked against the rest.
   const minArea = MIN_BLOB_FRACTION * w * h;
   const biggest = blobs.reduce((m, b) => Math.max(m, b.area), 0);
   let eligible = blobs.filter((b) => b.area >= minArea || b.area >= biggest * 0.2);
   // ...and drop the lacework. A hedge or a tree canopy fills its bounding
-  // box in a scatter rather than a shape; a subject is solid. If that leaves
-  // nothing at all, the photo has no solid subject and the unfiltered set is
-  // better than an empty mask.
-  const solid = eligible.filter((b) => blobFill(b) >= MIN_FILL);
+  // box in a scatter rather than a shape; a subject is solid. The rule only
+  // reaches blobs big enough to be scenery — see MIN_MASS_FRACTION. If it
+  // leaves nothing at all, the photo has no solid subject and the unfiltered
+  // set is better than an empty mask.
+  const solid = eligible.filter(
+    (b) => blobFill(b) >= MIN_FILL || b.area < MIN_MASS_FRACTION * w * h,
+  );
   if (solid.length) eligible = solid;
   const kept = eligible
     .sort((a, b) => blobScore(b, w, h) - blobScore(a, w, h))

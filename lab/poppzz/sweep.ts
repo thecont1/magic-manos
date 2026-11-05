@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  EDGE_PENALTY, MASK_BLUR_PX, MIN_BLOB_FRACTION, MIN_FILL,
+  EDGE_PENALTY, MASK_BLUR_PX, MIN_BLOB_FRACTION, MIN_FILL, MIN_MASS_FRACTION,
   blobFill, computeSaliency, labelBlobs, morph, otsuThreshold,
 } from '../../src/filters/poppzz-saliency.ts';
 import type { Blob } from '../../src/filters/poppzz-saliency.ts';
@@ -37,12 +37,14 @@ interface Params {
   subjects: number;
   minBlobFraction: number;
   minFill: number;
+  massFrac: number;
   edgePenalty: number;
 }
 
 const BASE: Params = {
   centerWeight: 0.4, threshold: 0, subjects: 3,
-  minBlobFraction: MIN_BLOB_FRACTION, minFill: MIN_FILL, edgePenalty: EDGE_PENALTY,
+  minBlobFraction: MIN_BLOB_FRACTION, minFill: MIN_FILL,
+  massFrac: MIN_MASS_FRACTION, edgePenalty: EDGE_PENALTY,
 };
 
 async function load(key: string) {
@@ -69,7 +71,9 @@ function run(
   const minArea = p.minBlobFraction * n;
   const biggest = blobs.reduce((m, b) => Math.max(m, b.area), 0);
   let eligible = blobs.filter((b) => b.area >= minArea || b.area >= biggest * 0.2);
-  const solid = eligible.filter((b) => blobFill(b) >= p.minFill);
+  const solid = eligible.filter(
+    (b) => blobFill(b) >= p.minFill || b.area < p.massFrac * n,
+  );
   if (solid.length) eligible = solid;
   const score = (b: Blob) => {
     const edge = b.x0 === 0 || b.y0 === 0 || b.x1 === w - 1 || b.y1 === h - 1 ? p.edgePenalty : 1;
@@ -147,10 +151,13 @@ if (which === 'all' || which === 'knobs') {
 
 if (which === 'all' || which === 'consts') {
   console.log('\n== MIN_BLOB_FRACTION ==');
-  for (const m of [0.015, 0.012, 0.01, 0.008, 0.005]) show(`minBlobFraction=${m}`, { ...BASE, minBlobFraction: m });
+  for (const m of [0.015, 0.012, 0.01, 0.008]) show(`minBlobFraction=${m}`, { ...BASE, minBlobFraction: m });
 
   console.log('\n== MIN_FILL ==');
-  for (const m of [0.2, 0.3, 0.4, 0.5]) show(`minFill=${m}`, { ...BASE, minFill: m });
+  for (const m of [0.3, 0.4, 0.5, 0.55, 0.6, 0.65]) show(`minFill=${m}`, { ...BASE, minFill: m });
+
+  console.log('\n== MIN_MASS_FRACTION ==');
+  for (const m of [0, 0.03, 0.05, 0.08, 0.12]) show(`massFrac=${m}`, { ...BASE, massFrac: m });
 
   console.log('\n== EDGE_PENALTY ==');
   for (const e of [0.25, 0.5, 0.75, 1.0]) show(`edgePenalty=${e}`, { ...BASE, edgePenalty: e });

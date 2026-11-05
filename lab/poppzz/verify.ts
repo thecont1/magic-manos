@@ -19,7 +19,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  EDGE_PENALTY, MASK_BLUR_PX, MIN_BLOB_FRACTION, MIN_FILL, TERM_FLOOR, W_BORDER, W_COLOR, W_PRIOR, W_RARE,
+  EDGE_PENALTY, MASK_BLUR_PX, MIN_BLOB_FRACTION, MIN_FILL, MIN_MASS_FRACTION, TERM_FLOOR, W_BORDER, W_COLOR, W_PRIOR, W_RARE,
   blobFill, blobScore, buildMask, computeSaliency, labelBlobs, morph, otsuThreshold,
 } from '../../src/filters/poppzz-saliency.ts';
 import type { Blob } from '../../src/filters/poppzz-saliency.ts';
@@ -62,7 +62,9 @@ function diagnose(
   const minArea = MIN_BLOB_FRACTION * w * h;
   const biggest = blobs.reduce((m, b) => Math.max(m, b.area), 0);
   const eligible = blobs.filter((b) => b.area >= minArea || b.area >= biggest * 0.2);
-  const solid = eligible.filter((b) => blobFill(b) >= MIN_FILL);
+  const solid = eligible.filter(
+    (b) => blobFill(b) >= MIN_FILL || b.area < MIN_MASS_FRACTION * w * h,
+  );
   const afterFill = solid.length ? solid : eligible;
   const ranked = [...afterFill].sort((a, b) => blobScore(b, w, h) - blobScore(a, w, h));
   return { cut, blobs, eligible, solid: afterFill, ranked: ranked.slice(0, Math.max(1, Math.round(subjects))) };
@@ -202,7 +204,8 @@ const rest = argv.filter((a) => a !== '--check');
 console.log('shipped constants:',
   `W_RARE=${W_RARE} W_COLOR=${W_COLOR} W_BORDER=${W_BORDER} W_PRIOR=${W_PRIOR}`,
   `TERM_FLOOR=${TERM_FLOOR} MIN_FILL=${MIN_FILL} EDGE_PENALTY=${EDGE_PENALTY}`,
-  `MIN_BLOB_FRACTION=${MIN_BLOB_FRACTION} MASK_BLUR_PX=${MASK_BLUR_PX}`);
+  `MIN_BLOB_FRACTION=${MIN_BLOB_FRACTION} MIN_MASS_FRACTION=${MIN_MASS_FRACTION}`,
+  `MASK_BLUR_PX=${MASK_BLUR_PX}`);
 
 const keys = rest[0] && !Number.isFinite(Number(rest[0])) ? [rest[0]] : PHOTOS.map((p) => p.key);
 const cw = Number(rest[1] ?? DEFAULTS.centerWeight);

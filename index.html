@@ -492,6 +492,11 @@ void main() {
 // desaturated. The mask is sampled at the *scaled* coordinate, so it grows
 // with the object; the pivot map (dilated to the largest scale the slider
 // allows) says which blob owns this pixel and where its centre is.
+//
+// The pivot map is sampled with linear filtering, so at a blob's edge the
+// pivot channels and the validity flag are both ramped down towards zero —
+// the pivot drifts towards (0,0) exactly where the silhouette is. They ramp
+// together, so dividing one by the other puts the pivot back where it was.
 const FRAG_POP = PRELUDE + `
 uniform sampler2D uImg;
 uniform sampler2D uMask;
@@ -504,7 +509,7 @@ uniform vec2 uShadowOffset;
 void main() {
   vec2 uv = vUV;
   vec4 pv = texture2D(uPivot, uv);
-  vec2 pivot = pv.gb;   // the blob's centre, in uv
+  vec2 pivot = pv.gb / max(pv.a, 1e-3);   // undo the edge interpolation
   vec2 fgUV = pivot + (uv - pivot) / uScale;
   float a = texture2D(uMask, fgUV).r * pv.a;
   vec3 fg = texture2D(uImg, fgUV).rgb;
@@ -512,6 +517,12 @@ void main() {
   float lum = dot(bg, vec3(0.299, 0.587, 0.114));
   bg = mix(bg, vec3(lum), uDesat);
   bg *= (1.0 - uDim);
+  // The background is dimmed everywhere, including under the subject — and
+  // the enlarged subject's feathered edge then blends against a dimmed copy
+  // of the subject's own edge pixels, which reads as a dark ring inside the
+  // silhouette. Put the original pixels back under the unscaled mask.
+  float a0 = texture2D(uMask, uv).r;
+  bg = mix(bg, texture2D(uImg, uv).rgb, a0);
   // The shadow is the blurred mask, nudged off the subject and darkened.
   float sh = texture2D(uMask, uv + uShadowOffset).r;
   bg *= (1.0 - uShadow * sh * 0.55);
@@ -1077,29 +1088,38 @@ function rebuildMask() {
       }
     }
   }
-  // The pivot map: for every pixel of the subject's footprint at the largest
-  // scale the slider allows, the centre of the blob it belongs to. Inverse
-  // warp the footprint back onto the mask to find out which blob it is.
-  // The warp only reaches the blob's own bounding box (grown by the largest
-  // scale), so there is no need to walk the whole frame for each subject.
+  // The pivot map: for every pixel of the subject's footprint, the centre of
+  // the blob it belongs to. Inverse warp the footprint back onto the mask to
+  // find out which blob it is.
+  //
+  // The warp has to be done at more than one scale. At the largest scale
+  // alone, a pixel of a concave subject — under the lady's outstretched arm,
+  // between the cenotaph's spires — warps outside the blob and never gets a
+  // pivot, so it drops back to the dimmed background and the subject comes
+  // out with a hole in it. Warping at 1 stamps the subject's own pixels, and
+  // the steps in between fill the gap up to the largest scale.
   for (const b of kept) {
     const pu = Math.round(b.cx / w * 255);
     const pv = Math.round(b.cy / h * 255);
-    const ox0 = Math.max(0, Math.floor(b.cx - (b.cx - b.x0) * MAX_SCALE));
-    const ox1 = Math.min(w - 1, Math.ceil(b.cx + (b.x1 - b.cx) * MAX_SCALE));
-    const oy0 = Math.max(0, Math.floor(b.cy - (b.cy - b.y0) * MAX_SCALE));
-    const oy1 = Math.min(h - 1, Math.ceil(b.cy + (b.y1 - b.cy) * MAX_SCALE));
-    for (let y = oy0; y <= oy1; y++) {
-      for (let x = ox0; x <= ox1; x++) {
-        const sx = b.cx + (x - b.cx) / MAX_SCALE;
-        const sy = b.cy + (y - b.cy) / MAX_SCALE;
-        const ix = Math.round(sx), iy = Math.round(sy);
-        if (ix < 0 || iy < 0 || ix >= w || iy >= h) continue;
-        if (labels[iy * w + ix] !== b.id) continue;
-        const i = y * w + x;
-        px[i * 4 + 1] = pu;
-        px[i * 4 + 2] = pv;
-        px[i * 4 + 3] = 255;   // this pixel has a pivot
+    for (const s of [1, 1 + (MAX_SCALE - 1) / 2, MAX_SCALE]) {
+      // The footprint at scale s is the blob's box grown about its centre.
+      const ox0 = Math.max(0, Math.floor(b.cx - (b.cx - b.x0) * s));
+      const ox1 = Math.min(w - 1, Math.ceil(b.cx + (b.x1 - b.cx) * s));
+      const oy0 = Math.max(0, Math.floor(b.cy - (b.cy - b.y0) * s));
+      const oy1 = Math.min(h - 1, Math.ceil(b.cy + (b.y1 - b.cy) * s));
+      for (let y = oy0; y <= oy1; y++) {
+        for (let x = ox0; x <= ox1; x++) {
+          const i = y * w + x;
+          if (px[i * 4 + 3]) continue;        // already has a pivot
+          const sx = b.cx + (x - b.cx) / s;
+          const sy = b.cy + (y - b.cy) / s;
+          const ix = Math.round(sx), iy = Math.round(sy);
+          if (ix < 0 || iy < 0 || ix >= w || iy >= h) continue;
+          if (labels[iy * w + ix] !== b.id) continue;
+          px[i * 4 + 1] = pu;
+          px[i * 4 + 2] = pv;
+          px[i * 4 + 3] = 255;   // this pixel has a pivot
+        }
       }
     }
   }

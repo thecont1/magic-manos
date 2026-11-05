@@ -68,7 +68,7 @@ Nothing is downloaded and no model is involved: the whole thing is a
 deterministic, dependency-free pipeline that runs in the browser.
 
 **Finding the subject.** The mask is built on a copy of the picture a third of
-the long edge (256–640px). Three maps are multiplied together:
+the long edge (256–640px). Four maps are multiplied together:
 
 - **colour rarity** — a smoothed Lab histogram of the frame; a pixel scores
   high when its colour is unusual. This is what makes the mask a *shape*
@@ -76,12 +76,40 @@ the long edge (256–640px). Three maps are multiplied together:
 - **colour contrast** — the distance from the frame's mean Lab.
 - **border contrast** — the distance from the mean colour along the edge of
   the frame, which is where the background usually is.
+- **centre prior** — a wide gaussian, so border clutter does not win outright.
 
-A wide gaussian centre prior keeps border clutter from winning. A gradient
-detail term was tried first and dropped: detail only fires on edges, so the
-mask came out as fragments of outlines rather than whole subjects.
+A gradient detail term was tried first and dropped: detail only fires on
+edges, so the mask came out as fragments of outlines rather than whole
+subjects.
 
-Two details matter more than they look:
+**Why a product, and with what exponents.** The four terms are combined as a
+**product of powers**, not as a weighted mean. This was measured, not assumed.
+A weighted geometric mean (weights summing to 1) smooths the map into a
+single hump; Otsu then cuts that hump in half and calls half the photograph a
+subject — measured on the Ritz photo, a 0.40/0.20/0.15/0.25 mean cut at
+0.4706, kept 33% of the frame, and isolated **none** of the three subjects.
+Taking a root before thresholding (`S ** 0.25`, the obvious fix for a
+skewed map) makes it worse, not better: it pulls the near-zero background
+mass *up* towards the subjects, the cut moves to 0.4627, and the whole frame
+becomes one blob.
+
+A product keeps the map bimodal — background mass down near zero, subjects
+standing clear above it — which is the shape Otsu is built to split. The
+exponents sum to 4, the number of terms, so the map keeps a product's shape
+while the ratios say what counts for more: rarity and the centre prior weigh
+more than the two contrast terms. `W_RARE = 1.2, W_COLOR = 0.8,
+W_BORDER = 0.8, W_PRIOR = 1.2`.
+
+**The floor.** One term at exactly zero would annihilate the pixel, and a pale
+grey-blue kurta against a stone wall is very nearly zero on the border term.
+Every term is lifted off zero (`TERM_FLOOR = 0.05`) before it is raised to its
+power, so no single weak term can wipe a pixel out.
+
+What the crowded low end actually needed was **more histogram bins**: Otsu
+runs with **1024 bins** on the product map, not 256. At 256 bins the mass near
+zero is crushed into the first few and the cut lands on a coarse step.
+
+Two more details matter more than they look:
 
 - The blur the saliency sees is measured in **source pixels** (18 of them),
   not in texels of the mask copy. In texels it would be a much tighter blur
@@ -95,8 +123,22 @@ Two details matter more than they look:
 The product is thresholded with Otsu (the `threshold` slider biases the cut),
 cleaned with a morphological close and open, split into connected components,
 and the specks are dropped: a blob has to clear 1.5% of the frame, or 20% of
-the biggest subject's area. What is left is ranked by total saliency and the
-top `subjects` of them pop out.
+the biggest subject's area.
+
+**Which blobs are subjects.** The blobs are ranked by **total saliency** —
+the sum of the saliency map over the blob — and the top `subjects` of them pop
+out. Two filters sit on top of that ranking:
+
+- **Solidity.** A blob has to fill at least 30% of its own bounding box
+  (`MIN_FILL`) to be eligible at all. A hedge is lacework — it fills its
+  bounding box in a scatter, not a shape — and a tree canopy is the same.
+  Ranking by fill ratio instead of filtering on it does not work: it demotes
+  the large, real foreground sari below a small solid bench blob.
+- **Edge penalty.** A blob that runs off the edge of the frame was never a
+  whole object; its score is halved rather than discarded, because the
+  subject sometimes really does touch the edge.
+
+If the solidity filter would empty the mask, the unfiltered set is used.
 
 **Compositing.** The mask is uploaded as one RGBA texture — R is the mask,
 G/B carry each blob's pivot and A says whether a pivot is valid — so every
@@ -104,6 +146,24 @@ subject can scale about its own centre in a single pass. The mask is blurred
 (the `feather` slider) for the soft boundary, and the edge is anti-aliased by
 a floor of 1.2 texels, because the mask is a binary image and its texels
 would otherwise show as facets along the silhouette.
+
+Three things about that single pass are easy to get wrong:
+
+- The pivot map is sampled with **linear** filtering, so at a blob's edge the
+  pivot channels and the validity flag are both ramped down towards zero and
+  the pivot drifts towards (0,0) exactly where the silhouette is visible. They
+  ramp together, so dividing one by the other puts the pivot back:
+  `vec2 pivot = pv.gb / max(pv.a, 1e-3);`
+- A pivot written only at the largest scale leaves concave subjects full of
+  holes — the pixels under an outstretched arm, or between two spires, have
+  no pivot and fall back to the dimmed background. The pivot map is therefore
+  warped at **three scales** (`1`, the middle, and the maximum) and each blob
+  stamps its own pixels at scale 1.
+- The background is dimmed everywhere, including *under* the subject, so the
+  enlarged subject's feathered edge blends against a dimmed copy of the
+  subject's own edge pixels and reads as a **dark ring** inside the
+  silhouette. The original pixels are put back under the unscaled mask,
+  after the dim and desaturation and before the shadow.
 
 | param | range | default | |
 |---|---|---|---|
@@ -113,14 +173,35 @@ would otherwise show as facets along the silhouette.
 | bgDesat | 0–100% | 12% | how much colour the background loses |
 | shadow | 0–100% | 35% | the drop shadow off the subject |
 | subjects | 1–5 | 3 | how many subjects to pop out |
-| threshold | −0.20–+0.20 | 0.00 | bias on the Otsu cut |
+| threshold | −0.06–+0.06 | 0.00 | bias on the Otsu cut, step 0.005 |
 | centerWeight | 0–1 | 0.40 | how hard the centre prior pulls |
+| debug | off/on | off | show the saliency map and the mask |
+
+**The debug view** replaces the composite with what the pipeline is actually
+doing: grey is the saliency map, red everything that came out of the
+threshold, green the blobs that were kept as subjects, and blue their
+outlines. It is a `bool` parameter of the filter, so it persists with the
+filter's state and only exists for `poppzz`.
 
 The mask depends only on the picture, not on the sliders, so it is built once
-when the image loads (~110ms, reported in the status line) and every slider
-stays live at 60fps. The mask sliders (`subjects`, `threshold`,
-`centerWeight`) change the mask itself, so they trigger a debounced rebuild.
-The mask is only built for `poppzz` — a Bloom session never pays for it.
+when the image loads (~160ms on a 2271×1703 frame, reported in the status
+line) and every slider stays live at 60fps. The mask sliders (`subjects`,
+`threshold`, `centerWeight`) change the mask itself, so they trigger a
+debounced rebuild. The mask is only built for `poppzz` — a Bloom session never
+pays for it.
+
+**Keeping it cheap.** The mask is built once, but the live render is on every
+slider tick, so:
+
+- The blurred mask is **cached** on the mask version and the feather value;
+  it is only re-blurred when one of those actually changes.
+- Bloom's working targets (including the ~64MB full-resolution threshold
+  buffer at 4608×3456) are allocated **only while Bloom is the running
+  filter** and released when another filter takes over. A separate copy
+  shader handles the filter-off path, so `poppzz` never allocates them at all.
+- `rgbToLab` writes into a caller-supplied array instead of returning a new
+  one per pixel, and the four fractional powers are tabulated — 1.2 million
+  `Math.pow` calls per rebuild becomes four table lookups per pixel.
 
 ## State
 

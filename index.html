@@ -113,6 +113,22 @@
   .prow .head span { color: #9c9aa2; }
   .prow .head output { color: #d8d6d0; font-variant-numeric: tabular-nums; }
   .prow input[type="range"] { width: 100%; accent-color: #ffb45e; margin: 0; }
+  /* A boolean row sits on one line: name and state on the left, the box on
+     the right. It is a switch, not a dial — there is nothing in between. */
+  .prow.bool { flex-direction: row; align-items: center; justify-content: space-between; }
+  .prow.bool .head { flex: 1; gap: 8px; }
+  .prow.bool input[type="checkbox"] {
+    appearance: none; margin: 0; width: 30px; height: 17px; border-radius: 9px;
+    background: #3a3a40; border: 1px solid #4a4a52; position: relative;
+    cursor: pointer; transition: all .15s; flex: none;
+  }
+  .prow.bool input[type="checkbox"]::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px;
+    border-radius: 50%; background: #6b6a72; transition: all .15s;
+  }
+  .prow.bool input[type="checkbox"]:checked { background: #ffb45e26; border-color: #ffb45e; }
+  .prow.bool input[type="checkbox"]:checked::after { left: 15px; background: #ffb45e; }
+  .prow.bool input[type="checkbox"]:focus-visible { outline: 2px solid #ffb45e88; outline-offset: 2px; }
   /* Filter off: the panel body dims, but the switch itself stays lit. */
   #side.off .filter-panel .panel-body { opacity: .4; }
 
@@ -313,7 +329,7 @@ const FILTERS = {
     // `mask: true` marks the sliders that change the mask itself (rather than
     // the composite); those trigger a rebuild instead of a redraw.
     defaults: { scale: 1.03, feather: 12, bgDim: 0.18, bgDesat: 0.12, shadow: 0.35,
-                threshold: 0, centerWeight: 0.4, subjects: 3 },
+                threshold: 0, centerWeight: 0.4, subjects: 3, debug: 0 },
     params: [
       { key: 'scale', min: 1, max: 1.1, step: 0.005,
         fmt: v => `${v.toFixed(3)}×` },
@@ -336,6 +352,8 @@ const FILTERS = {
         fmt: v => (v >= 0 ? '+' : '') + v.toFixed(3) },
       { key: 'centerWeight', min: 0, max: 1, step: 0.01, mask: true,
         fmt: v => v.toFixed(2) },
+      { key: 'debug', type: 'bool', min: 0, max: 1, step: 1,
+        fmt: v => (v ? 'on' : 'off') },
     ],
   },
 };
@@ -534,6 +552,20 @@ void main() {
   gl_FragColor = vec4(mix(bg, fg, smoothstep(0.0, 1.0, a)), 1.0);
 }`;
 
+// The debug view: what the saliency pipeline is actually doing. The grey is
+// the saliency map, red is everything that came out of the threshold, green
+// the blobs that were kept as subjects, and blue their outlines.
+const FRAG_DEBUG = PRELUDE + `
+uniform sampler2D uDbg;
+void main() {
+  vec4 d = texture2D(uDbg, vUV);
+  vec3 c = vec3(d.r);
+  c = mix(c, vec3(1.0, 0.30, 0.25), d.g * 0.45);
+  c = mix(c, vec3(0.35, 1.0, 0.45), d.b * 0.45);
+  c = mix(c, vec3(0.45, 0.80, 1.0), d.a * 0.9);
+  gl_FragColor = vec4(c, 1.0);
+}`;
+
 function compile(type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
@@ -556,11 +588,12 @@ const progPre = makeProgram(FRAG_PRE);
 const progBlur = makeProgram(FRAG_BLUR);
 const progComp = makeProgram(FRAG_COMP);
 const progPop = makeProgram(FRAG_POP);
+const progDbg = makeProgram(FRAG_DEBUG);
 
 // Enumerate each program's uniforms once; lookups return null for anything the
 // compiler dropped, which uniform*() calls then harmlessly ignore.
 const UL = new Map();
-for (const p of [progPre, progBlur, progComp, progPop]) {
+for (const p of [progPre, progBlur, progComp, progPop, progDbg]) {
   const m = {};
   const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
   for (let i = 0; i < n; i++) {
@@ -783,6 +816,7 @@ const EDGE_PENALTY = 0.5;
 let maskSrc = null;      // the downscaled frame: {data, w, h}
 let maskTex = null;      // RGBA: R = mask, G/B = pivot (u,v), A = pivot valid
 let maskOut = null, maskTmp = null;  // blur targets for the mask
+let maskDbg = null;      // RGBA: R = saliency, G = mask, B = kept, A = outline
 let maskReady = false;
 let maskTimer = 0;
 let maskMs = 0;          // how long the saliency pipeline took
@@ -1102,12 +1136,13 @@ function lutLookup(lut, v) {
 // --- the mask, from the saliency map to the GPU ---------------------------
 
 function allocMaskTargets(w, h) {
-  for (const t of [maskTex, maskOut, maskTmp]) {
+  for (const t of [maskTex, maskOut, maskTmp, maskDbg]) {
     if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
   }
   maskTex = makeTarget(w, h);
   maskOut = makeTarget(w, h);
   maskTmp = makeTarget(w, h);
+  maskDbg = makeTarget(w, h);
 }
 
 // How good a candidate subject a blob is.
@@ -1228,6 +1263,40 @@ function rebuildMask() {
 
   gl.bindTexture(gl.TEXTURE_2D, maskTex.tex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+
+  // The debug view: R is the saliency map as Otsu sees it, G every blob that
+  // came out of the threshold, B the blobs that were kept, A the outline of
+  // the kept ones. It is built here, while the numbers are to hand.
+  const dbg = new Uint8Array(w * h * 4);
+  let salMax = 0;
+  for (let i = 0; i < w * h; i++) if (S[i] > salMax) salMax = S[i];
+  for (let i = 0; i < w * h; i++) {
+    dbg[i * 4] = salMax ? Math.round(S[i] / salMax * 255) : 0;
+    dbg[i * 4 + 1] = bin[i] ? 255 : 0;
+  }
+  for (const b of kept) {
+    for (let y = b.y0; y <= b.y1; y++) {
+      for (let x = b.x0; x <= b.x1; x++) {
+        const i = y * w + x;
+        if (labels[i] === b.id) dbg[i * 4 + 2] = 255;
+      }
+    }
+  }
+  // The outline is the kept mask minus its own erosion.
+  const keptMask = new Uint8Array(w * h);
+  for (const b of kept) {
+    for (let y = b.y0; y <= b.y1; y++) {
+      for (let x = b.x0; x <= b.x1; x++) {
+        const i = y * w + x;
+        if (labels[i] === b.id) keptMask[i] = 1;
+      }
+    }
+  }
+  const inner = morph(keptMask, w, h, 'min');
+  for (let i = 0; i < w * h; i++) if (keptMask[i] && !inner[i]) dbg[i * 4 + 3] = 255;
+  gl.bindTexture(gl.TEXTURE_2D, maskDbg.tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, dbg);
+
   maskReady = true;
   maskMs = performance.now() - t0;
 }
@@ -1262,6 +1331,17 @@ function applyPoppzz(src, dst, entry) {
       gl.uniform1f(L('uOn'), 0);
       gl.uniform1i(L('uTex'), 0); gl.uniform1i(L('uSoft'), 1); gl.uniform1i(L('uBloom'), 2);
       bindTex(0, src); bindTex(1, T.soft.tex); bindTex(2, T.bloom.tex);
+    });
+    return;
+  }
+  // The debug view replaces the composite entirely: the saliency map, the
+  // binary mask and the blob outlines, so the pipeline can be seen rather
+  // than guessed at.
+  if (p.debug) {
+    pass(progDbg, dst, imgW, imgH, L => {
+      gl.uniform1f(L('uFlipY'), dst ? 0 : 1);
+      gl.uniform1i(L('uDbg'), 0);
+      bindTex(0, maskDbg.tex);
     });
     return;
   }
@@ -1534,6 +1614,28 @@ function buildControls() {
     const out = document.createElement('output');
     out.textContent = fmt(d, params[currentFilter][d.key] ?? d.min);
     head.append(name, out);
+
+    if (d.type === 'bool') {
+      // A checkbox rather than a slider: on or off, nothing in between.
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.id = `${currentFilter}-${d.key}`;
+      box.checked = !!params[currentFilter][d.key];
+      box.setAttribute('aria-label', `${def.name} ${d.key}`);
+      row.className = 'prow bool';
+      row.append(head, box);
+      host.append(row);
+      sliders[d.key] = box;
+      outputs[d.key] = out;
+      box.addEventListener('input', () => {
+        params[currentFilter][d.key] = box.checked ? 1 : 0;
+        out.textContent = fmt(d, params[currentFilter][d.key]);
+        scheduleRender();
+        saveState();
+      });
+      continue;
+    }
+
     const input = document.createElement('input');
     input.type = 'range';
     input.id = `${currentFilter}-${d.key}`;
@@ -1575,7 +1677,9 @@ $('filter').addEventListener('change', e => {
 $('reset').addEventListener('click', () => {
   params[currentFilter] = { ...FILTERS[currentFilter].defaults };
   for (const [k, el] of Object.entries(sliders)) {
-    el.value = params[currentFilter][k];
+    // A checkbox is set by `checked`, not by `value`.
+    if (el.type === 'checkbox') el.checked = !!params[currentFilter][k];
+    else el.value = params[currentFilter][k];
     el.dispatchEvent(new Event('input'));
   }
   saveState();

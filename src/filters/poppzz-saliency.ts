@@ -182,23 +182,20 @@ export function blurPlane(src: Float32Array, w: number, h: number, sigma: number
   return a;
 }
 
-/** Min or max over a 3×3 box — the structuring element for the morphology. */
+/** Min or max over a full 3×3 box — the structuring element for the morphology. */
 export function morph(src: Uint8Array, w: number, h: number, op: 'min' | 'max'): Uint8Array {
   const pick = op === 'max' ? Math.max : Math.min;
-  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  const out = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       let v = src[y * w + x];
-      if (x > 0) v = pick(v, src[y * w + x - 1]);
-      if (x < w - 1) v = pick(v, src[y * w + x + 1]);
-      tmp[y * w + x] = v;
-    }
-  }
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let v = tmp[y * w + x];
-      if (y > 0) v = pick(v, tmp[(y - 1) * w + x]);
-      if (y < h - 1) v = pick(v, tmp[(y + 1) * w + x]);
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = y + dy < 0 ? 0 : y + dy >= h ? h - 1 : y + dy;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx < 0 ? 0 : x + dx >= w ? w - 1 : x + dx;
+          v = pick(v, src[ny * w + nx]);
+        }
+      }
       out[y * w + x] = v;
     }
   }

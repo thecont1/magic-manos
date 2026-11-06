@@ -133,7 +133,7 @@ function allocMaskTargets(w: number, h: number): void {
 export function prepareMaskSource(src: TexImageSource, w: number, h: number): void {
   const long = Math.max(w, h);
   const edge = Math.min(MASK_MAX_EDGE, Math.max(MASK_MIN_EDGE, Math.round(long / 3)));
-  const s = Math.min(1, edge / long);
+  const s = edge / long;
   const mw = Math.max(8, Math.round(w * s)), mh = Math.max(8, Math.round(h * s));
   const c = document.createElement('canvas');
   c.width = mw;
@@ -263,13 +263,15 @@ export function renderPoppzz(src: WebGLTexture, dst: Target | null, p: ParamValu
     return;
   }
   blurMask(p.feather);
+  const bgDim = p.bgFx ? p.bgDim : 0;
+  const bgDesat = p.bgFx ? p.bgDesat : 0;
   pass(progPop, dst, state.imgW, state.imgH, (L) => {
     gl.uniform1f(L('uFlipY'), dst ? 0 : 1);
     gl.uniform1f(L('uScale'), p.scale);
-    gl.uniform1f(L('uDim'), p.bgDim);
-    gl.uniform1f(L('uDesat'), p.bgDesat);
+    gl.uniform1f(L('uDim'), bgDim);
+    gl.uniform1f(L('uDesat'), bgDesat);
     gl.uniform1f(L('uShadow'), p.shadow);
-    gl.uniform2f(L('uShadowOffset'), 0.0015, 0.0015);
+    gl.uniform2f(L('uShadowOffset'), 4 / state.imgW, 4 / state.imgH);
     gl.uniform1i(L('uImg'), 0);
     gl.uniform1i(L('uMask'), 1);
     gl.uniform1i(L('uPivot'), 2);
@@ -291,7 +293,7 @@ export const poppzzDef: FilterDef = {
   // `mask: true` marks the sliders that change the mask itself (rather than
   // the composite); those trigger a rebuild instead of a redraw.
   defaults: {
-    scale: 1.03, feather: 12, bgDim: 0.18, bgDesat: 0.12, shadow: 0.35,
+    scale: 1.03, feather: 12, bgDim: 0.18, bgDesat: 0.12, shadow: 0.35, bgFx: 1,
     threshold: 0, centerWeight: 0.4, subjects: 3, debug: 0,
   },
   params: [
@@ -300,6 +302,7 @@ export const poppzzDef: FilterDef = {
     { key: 'bgDim', min: 0, max: 0.6, step: 0.01, fmt: (v) => `${Math.round(v * 100)}%` },
     { key: 'bgDesat', min: 0, max: 1, step: 0.01, fmt: (v) => `${Math.round(v * 100)}%` },
     { key: 'shadow', min: 0, max: 1, step: 0.01, fmt: (v) => `${Math.round(v * 100)}%` },
+    { key: 'bgFx', type: 'bool', min: 0, max: 1, step: 1, fmt: (v) => (v ? 'on' : 'off') },
     { key: 'subjects', min: 1, max: 5, step: 1, mask: true, fmt: (v) => `${Math.round(v)}` },
     // The cut lives in the saliency map's own units. Otsu lands at about
     // 0.20 on a typical frame, so this nudges the cut around that point:
